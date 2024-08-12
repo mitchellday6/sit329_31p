@@ -1,154 +1,95 @@
-#include "TIMER_DEAKIN.h"
-#include "wiring_private.h"
-#include <stdint.h>
+// timer_deakin.cpp
 
-volatile uint16_t count3 = 0, count4 = 0, count5 = 0;
-uint16_t endCount3 = 0, endCount4 = 0, endCount5 = 0;
+#include "timer_deakin.h"
+#include <Arduino.h>
+#include "sam.h"
 
-TIMER_DEAKIN::TIMER_DEAKIN() : count3(0), count4(0), count5(0), endCount3(0), endCount4(0), endCount5(0)
-{
-    
-}
-
-// Configures specific PIN on PORT to OUTPUT/INPUT
-bool TIMER_DEAKIN::config_timer(int timerNo, int countStart, int countEnd, int timerresolution)
-{
-    TcCount16 *TC;
-    uint timerId;
-    Serial.println(timerNo);
-
-    switch (timerNo)
-    {
-    case 3:
-        TC = (TcCount16 *) TC3;
-        PM->APBCMASK.reg |= PM_APBCMASK_TC3;
-        timerId = GCLK_CLKCTRL_ID_TCC2_TC3;
-        NVIC_EnableIRQ(TC3_IRQn);
-        count3 = countStart;
-        endCount3 = countEnd;
-        Serial.println(count3);
-        Serial.println(endCount3);
-        break;
-    case 4:
-        TC = (TcCount16 *) TC4;
-        PM->APBCMASK.reg |= PM_APBCMASK_TC4;
-        timerId = GCLK_CLKCTRL_ID_TC4_TC5;
-        NVIC_EnableIRQ(TC4_IRQn);
-        count4 = countStart;
-        endCount4 = countEnd;
-        break;
-    case 5:
-        TC = (TcCount16 *) TC5;
-        PM->APBCMASK.reg |= PM_APBCMASK_TC5;
-        timerId = GCLK_CLKCTRL_ID_TC4_TC5;
-        NVIC_EnableIRQ(TC5_IRQn);
-        count5 = countStart;
-        endCount5 = countEnd;
-        break;
-    default:
-        return false;
-        break;
+bool TIMER_DEAKIN::config_timer(uint8_t timer_num, uint16_t start_val, uint32_t end_val, uint16_t resolution) {
+    if (timer_num < 3 || timer_num > 5) {
+        return false; // Only TC3, TC4, and TC5 are valid for SAMD21G18A
     }
 
-    //set clock values
-    GCLK->GENDIV.reg = GCLK_GENDIV_DIV(1) | GCLK_GENDIV_ID(4);
+    tick_count = start_val;
+    tcNo = timer_num;
+    res = resolution;
+    endTick = end_val;
+
+    //choose the correct Timer and power values
+    switch (timer_num) {
+        case 3: 
+            TC = (TcCount16*) TC3;
+            PM->APBCMASK.reg |= PM_APBCMASK_TC3; 
+            break;
+        case 4: 
+            TC = (TcCount16*) TC4; 
+            PM->APBCMASK.reg |= PM_APBCMASK_TC4;
+            break;
+        case 5: 
+            TC = (TcCount16*) TC5; 
+            PM->APBCMASK.reg |= PM_APBCMASK_TC5;
+            break;
+        default: 
+            return false; // Invalid timer number
+    }
+
+  
+    // Configure GCLK for the timer
+    GCLK->CLKCTRL.reg = GCLK_CLKCTRL_ID(GCM_TC4_TC5 + (timer_num - 4)) | GCLK_CLKCTRL_GEN_GCLK0 | GCLK_CLKCTRL_CLKEN;
     while (GCLK->STATUS.bit.SYNCBUSY);
 
-    GCLK->GENCTRL.reg = GCLK_GENCTRL_IDC | GCLK_GENCTRL_GENEN | GCLK_GENCTRL_SRC_DFLL48M | GCLK_GENCTRL_ID(4);
-    while (GCLK->STATUS.bit.SYNCBUSY);
 
-    GCLK->CLKCTRL.reg = GCLK_CLKCTRL_CLKEN | GCLK_CLKCTRL_GEN_GCLK4 | timerId;
-    while (GCLK->STATUS.bit.SYNCBUSY);
+    //msTcStep is the number of milliseconds in a single timer tick after prescalar
+    const float msTcStep = 64.0f/48000.0f;
 
-    //reset the selected timer
-    TC->CTRLA.reg = TC_CTRLA_SWRST;
+    //stepDivider is the number of timer ticks it takes to reach the step resolution value
+    const uint16_t stepDivider = round(res/(msTcStep*10));
+
+    //this finds how many times the tick step value divides into 65535 (max compare)
+    //it then gets the floor of that so the compare value is divisible by step and less then 16bit
+    uint16_t compare = stepDivider*(floor(65535/stepDivider));
+
+    //set the COUNT and compare registers for the timer
+    TC->COUNT.reg = start_val;
+    TC->CC[0].reg = compare;
     while (TC->STATUS.bit.SYNCBUSY);
 
-    TC->CTRLA.reg = TC_CTRLA_MODE_COUNT16;
-    while (TC->STATUS.bit.SYNCBUSY);
-
-    TC->CTRLA.reg |= TC_CTRLA_WAVEGEN_NFRQ;
-    while (TC->STATUS.bit.SYNCBUSY);
-
-    TC->CTRLA.reg |= TC_CTRLA_PRESCALER_DIV256;
-    while (TC->STATUS.bit.SYNCBUSY);
-
-    uint scalar = 256;
-    float freq = 48000000.0;
-    float interval = scalar/freq;
-    uint16_t compareVal = round(timerresolution/interval);
-
-
-    TC->COUNT.reg = 0;
-    TC->CC[0].reg = compareVal;
-    while (TC->STATUS.bit.SYNCBUSY);
-
-    TC->INTENSET.reg = 0;
-    TC->INTENSET.bit.MC0 = 1;
-
+    //configure timer for 16 bit with a prescalar of 64
+    TC->CTRLA.reg = TC_CTRLA_MODE_COUNT16 | TC_CTRLA_PRESCALER_DIV64;
     TC->CTRLA.reg |= TC_CTRLA_ENABLE;
-}
+    while (TC->STATUS.bit.SYNCBUSY);
 
-uint TIMER_DEAKIN::getTC3_count()
-{
-    return count3;
-};
-uint TIMER_DEAKIN::getTC4_count()
-{
-    return count4;
-};
-uint TIMER_DEAKIN::getTC5_count()
-{
-    return count5;
-};
-
-// input waitTime is in 10ths of a millisecond
-bool TIMER_DEAKIN::wait(uint waitTime) {
-    uint resolution = 1; //10ths of ms
-    
-    bool configured = config_timer(3, 0, waitTime/resolution, resolution);
-    if(!configured){
-        Serial.println("Bad Timer Configuration");
-        return false;
-    }
-
-    while(getTC3_count() < waitTime){
-        
-    }
     return true;
 }
 
-void TC3_Handler() {
-
-    Serial.println(TC3->COUNT16.INTFLAG.bit.MC0);
-    if (TC3->COUNT16.INTFLAG.bit.MC0) {
-        TC3->COUNT16.INTFLAG.bit.MC0 = 1; // Clear the interrupt flag
-        if(count3 == endCount3){
-            count3 = 0;
-        } else {
-            count3++;
-        }
-    }
+//method returns the current timer wrapper count number
+uint16_t TIMER_DEAKIN::getTC_count() {
+    return tick_count;
 }
 
-void TC4_Handler() {
-    if (TC4->COUNT16.INTFLAG.bit.MC0) {
-        TC4->COUNT16.INTFLAG.bit.MC0 = 1; // Clear the interrupt flag
-        if(count4 == endCount4){
-            count4 = 0;
-        } else {
-            count4++;
-        }
-    }
-}
+//waits for a period of time defined by the input in 10ths of a millisecond
+void TIMER_DEAKIN::wait(uint32_t period_in_0_1ms) {
 
-void TC5_Handler() {
-    if (TC5->COUNT16.INTFLAG.bit.MC0) {
-        TC5->COUNT16.INTFLAG.bit.MC0 = 1; // Clear the interrupt flag
-        if(count5 == endCount5){
-            count5 = 0;
-        } else {
-            count5++;
+    uint16_t start_val = 0;
+    uint16_t resolution = 1; //in 10ths of a millisecond
+    uint32_t end_val = period_in_0_1ms/resolution; //total ticks to wait
+    const float msTcStep = 64.0f/48000.0f;
+
+    const uint16_t stepDivider = round(resolution/(10*msTcStep));
+
+    bool configured = config_timer(4, start_val, end_val, resolution); // Using timer 3 for wait
+    
+    unsigned long startMillis = millis();
+
+    //will perform tick increment while the tick_count is still less the the endTick value
+    while(tick_count < endTick){
+        if(TC->COUNT.reg >= stepDivider){
+            tick_count++; //increment tick count
+            TC->COUNT.reg = 0; //set the timers register count back to 0
         }
     }
+
+    //used for testing timing functionality
+    unsigned long elapsedMillis = millis() - startMillis;
+    Serial.print("Elapsed Time (ms): "); Serial.println(elapsedMillis);
+    tick_count = 0;
 }
